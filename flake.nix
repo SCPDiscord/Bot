@@ -1,5 +1,5 @@
 {
-  description = "Affordable full-body tracking for VR!";
+  description = "";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -38,7 +38,7 @@
         # packages.default = pkgs.hello;
 
         devenv.shells.default = {
-          name = "slimevr";
+          name = "scpsl-bot";
 
           imports = [
             # This is just like the imports in devenv.nix.
