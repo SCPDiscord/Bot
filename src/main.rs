@@ -2,26 +2,38 @@ mod commands;
 mod server;
 
 use std::cell::OnceCell;
+use std::collections::VecDeque;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use color_eyre::Result;
 use dashmap::DashMap;
+use enum_map::enum_map;
 use log::{error, info};
 use serenity::async_trait;
 use serenity::model::application::command::Command;
 use serenity::model::application::interaction::{Interaction, InteractionResponseType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::GuildId;
-use serenity::model::prelude::Activity;
+use serenity::model::prelude::{Activity, ActivityType};
 use serenity::prelude::*;
-use server::{create_server, ClientEvent, ServerEvent};
-use tokio::sync::mpsc::{Receiver, Sender};
+use server::{create_server, s2c, c2s};
+use tokio::sync::{self, mpsc::Receiver};
+
+struct CommandExecutionWaiter;
+impl TypeMapKey for CommandExecutionWaiter {
+    type Value = Arc<DashMap<u64, sync::oneshot::Sender<c2s::CommandReplyEvent>>>;
+}
+
+struct ServerConnection;
+impl TypeMapKey for ServerConnection {
+    type Value = Arc<DashMap<SocketAddr, sync::mpsc::Sender<s2c::ClientEvent>>>;
+}
 
 struct Handler {
-    rx_server: Arc<Mutex<OnceCell<Receiver<ServerEvent>>>>,
-    connected_servers: Arc<DashMap<SocketAddr, Sender<ClientEvent>>>,
+    rx_server: Arc<Mutex<OnceCell<Receiver<c2s::ServerEvent>>>>,
 }
 
 #[async_trait]
@@ -87,19 +99,42 @@ impl EventHandler for Handler {
 
         let rx_server = self.rx_server.clone();
         tokio::spawn(async move {
-            let rx = {
+            let mut rx = {
                 let mut lock = rx_server.lock().unwrap();
                 lock.take().unwrap()
             };
+            let mut log_deqs = enum_map! {
+                _ => VecDeque::new()
+            };
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
             loop {
-                let Some(event) = rx.recv().await else { continue };
-                match event {
-                    ServerEvent::Status(status) => {
-                        ctx.set_presence(
-                            status.activity.map(|name| Activity::playing(name)),
-                            status.status,
-                        )
-                        .await
+                tokio::select! {
+                    Some(event) = rx.recv() => {
+                        match event {
+                            c2s::ServerEvent::Status(status) => {
+                                ctx.set_presence(
+                                    status.activity.map(|name| {
+                                        let mut activity = Activity::playing("~");
+                                        activity.state = Some(name);
+                                        activity.kind = ActivityType::Custom;
+                                        activity
+                                    }),
+                                    status.status,
+                                )
+                                .await
+                            },
+                            c2s::ServerEvent::Log(log) => {
+                                log_deqs[log.r#type].push_back(log.message)
+                            },
+                            c2s::ServerEvent::CommandReply(_) => todo!("Haven't done command execution yet")
+                        }
+                    },
+                    _ = interval.tick() => {
+                        for (log_type, deq) in log_deqs.iter_mut() {
+							todo!("Get log channel")
+                        }
                     }
                 }
             }
@@ -118,9 +153,10 @@ async fn main() -> Result<()> {
     let token = env::var("DISCORD_TOKEN").expect("Expected a DISCORD_TOKEN in the environment");
 
     let (rx_server, connected_servers) = create_server().await?;
+    let cell = OnceCell::new();
+    cell.set(rx_server).expect("Couldn't set Receiver");
     let handler = Handler {
-        rx_server: Arc::new(Mutex::new(rx_server)),
-        connected_servers,
+        rx_server: Arc::new(Mutex::new(cell)),
     };
 
     // Build our client.
@@ -128,6 +164,13 @@ async fn main() -> Result<()> {
         .event_handler(handler)
         .await
         .expect("Error creating client");
+
+    {
+        let mut data = client.data.write().await;
+
+        data.insert::<ServerConnection>(connected_servers);
+        data.insert::<CommandExecutionWaiter>(Arc::new(DashMap::new()));
+    }
 
     // Finally, start a single shard, and start listening to events.
     //
