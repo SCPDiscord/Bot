@@ -15,4 +15,5 @@ color-eyre = "0.6"
 dashmap = "5.5.3"
 log = "0.4"
 pretty_env_logger = "0.5"
-enum-map = "2.6.3"
+enum-map = { version = "2.6.3", features = ["serde"] }
+toml_edit = { version = "0.20", features = ["serde"]}
